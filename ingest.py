@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 from pymongo import MongoClient, ASCENDING, UpdateOne
 
-# ---------- Parsing functions (unchanged, confirmed working) ----------
 
 def extract_domain(url: str) -> str:
     if not url:
@@ -21,7 +20,7 @@ def strip_urls_mentions(text: str) -> str:
     return no_mentions.strip()
 
 def parse_tweet(raw: dict) -> dict:
-    created_at = parse_created_at(raw["postedTime"])
+    created_at = parse_created_at(raw["object"]["postedTime"])  # <-- changed from raw["postedTime"]
     entities = raw.get("twitter_entities", {})
     hashtags = [h["text"].lower() for h in entities.get("hashtags", [])]
     mentions = [m["screen_name"] for m in entities.get("user_mentions", [])]
@@ -56,7 +55,6 @@ def parse_user(raw: dict) -> dict:
         "url_domain": extract_domain(profile_url) if profile_url else None,
     }
 
-# ---------- Load raw file ----------
 
 def load_raw(path: str) -> list[dict]:
     with open(path) as f:
@@ -67,7 +65,6 @@ def load_raw(path: str) -> list[dict]:
         else:
             return [json.loads(line) for line in f if line.strip()]
 
-# ---------- Main pipeline ----------
 
 def run_pipeline(path: str, mongo_uri: str = "mongodb://localhost:27017", db_name: str = "comp8210"):
     client = MongoClient(mongo_uri)
@@ -76,23 +73,21 @@ def run_pipeline(path: str, mongo_uri: str = "mongodb://localhost:27017", db_nam
     raw_records = load_raw(path)
     print(f"Loaded {len(raw_records)} raw records")
 
-    # Parse everything first
     tweets = []
-    users = {}  # keyed by user_id, so we naturally dedupe/upsert-in-memory too
+    users = {}  
     skipped = 0
 
     for raw in raw_records:
         try:
             tweets.append(parse_tweet(raw))
             u = parse_user(raw)
-            users[u["user_id"]] = u  # last-seen wins for user profile fields
+            users[u["user_id"]] = u  
         except (KeyError, TypeError) as e:
             skipped += 1
             continue  # malformed record, skip rather than crash whole pipeline
 
     print(f"Parsed {len(tweets)} tweets, {skipped} skipped due to missing fields")
 
-    # ---- Dedup by id_str, keep latest by created_at ----
     latest_by_id = {}
     for t in tweets:
         existing = latest_by_id.get(t["id_str"])
@@ -102,8 +97,6 @@ def run_pipeline(path: str, mongo_uri: str = "mongodb://localhost:27017", db_nam
     deduped_tweets = list(latest_by_id.values())
     print(f"After dedup: {len(deduped_tweets)} unique tweets "
           f"({len(tweets) - len(deduped_tweets)} duplicates removed)")
-
-    # ---- Write to tweets_raw (optional full raw dump) and tweets_clean ----
     if raw_records:
         db.tweets_raw.delete_many({})
         db.tweets_raw.insert_many(raw_records)
@@ -111,7 +104,6 @@ def run_pipeline(path: str, mongo_uri: str = "mongodb://localhost:27017", db_nam
     db.tweets_clean.delete_many({})
     db.tweets_clean.insert_many(deduped_tweets)
 
-    # ---- Upsert users collection ----
     user_ops = [
         UpdateOne({"user_id": u["user_id"]}, {"$set": u}, upsert=True)
         for u in users.values()
@@ -122,7 +114,6 @@ def run_pipeline(path: str, mongo_uri: str = "mongodb://localhost:27017", db_nam
     print(f"Wrote {len(deduped_tweets)} tweets to tweets_clean, "
           f"{len(users)} users upserted")
 
-    # ---- Indexes ----
     db.tweets_clean.create_index([("created_at", ASCENDING)])
     db.tweets_clean.create_index([("hashtags", ASCENDING), ("created_at", ASCENDING)])
     db.tweets_clean.create_index([("user_id", ASCENDING), ("created_at", ASCENDING)])
